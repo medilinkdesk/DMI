@@ -966,6 +966,14 @@ input:focus, select:focus, textarea:focus {
   animation: modalPop 0.2s ease-out;
 }
 
+.modal-card.modal-lg {
+  max-width: 720px;
+}
+
+.mb-3 {
+  margin-bottom: 1rem !important;
+}
+
 @keyframes modalPop {
   from { transform: scale(0.95); opacity: 0; }
   to { transform: scale(1); opacity: 1; }

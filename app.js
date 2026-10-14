@@ -523,6 +523,7 @@ function handleBarcodeScan(scannedCode) {
     const extraMatch = state.currentSession.extraStock.find(item => item.ean.toLowerCase() === codeStr.toLowerCase());
     if (extraMatch) {
       displayProductCard(extraMatch, true);
+      displayItemVerificationPopup(extraMatch, true);
       playBeep('success');
       showToast(`Extra Item Scanned: ${codeStr}`, 'info');
       return;
@@ -567,6 +568,7 @@ function executeScanForItem(item) {
   displayProductCard(item, false);
   updateScanViewSummary();
   DB.saveSession(state.currentSession);
+  displayItemVerificationPopup(item, false);
 }
 
 function displayProductCard(item, isExtra = false) {
@@ -869,13 +871,14 @@ document.getElementById('form-extra-stock').addEventListener('submit', (e) => {
   state.currentSession.extraStock.push(extraItem);
   document.getElementById('modal-extra-stock').classList.add('hidden');
   displayProductCard(extraItem, true);
+  displayItemVerificationPopup(extraItem, true);
   updateScanViewSummary();
   DB.saveSession(state.currentSession);
   showToast('Unlisted Extra Stock Item added', 'success');
 });
 
 // ==========================================
-// 8. CAMERA BARCODE SCANNER MODULE (ZXing)
+// 8. CAMERA BARCODE SCANNER & ITEM VERIFICATION POPUP MODULE
 // ==========================================
 document.getElementById('btn-open-camera').addEventListener('click', async () => {
   const modal = document.getElementById('modal-camera-scanner');
@@ -888,7 +891,16 @@ document.getElementById('btn-close-camera').addEventListener('click', () => {
   document.getElementById('modal-camera-scanner').classList.add('hidden');
 });
 
-async function startCameraScanner() {
+// Switch camera device when select dropdown changes
+document.getElementById('select-camera-device')?.addEventListener('change', (e) => {
+  const newDeviceId = e.target.value;
+  if (newDeviceId) {
+    stopCameraScanner();
+    startCameraScanner(newDeviceId);
+  }
+});
+
+async function startCameraScanner(deviceIdToUse = null) {
   if (state.isScanningCamera) return;
 
   try {
@@ -897,49 +909,349 @@ async function startCameraScanner() {
       return;
     }
 
-    const codeReader = new ZXing.BrowserMultiFormatReader();
-    state.zxingReader = codeReader;
+    if (!state.zxingReader) {
+      state.zxingReader = new ZXing.BrowserMultiFormatReader();
+    }
+    const codeReader = state.zxingReader;
 
-    const videoInputDevices = await codeReader.listVideoInputDevices();
+    let videoInputDevices = [];
+    try {
+      videoInputDevices = await codeReader.listVideoInputDevices();
+    } catch (e) {
+      console.warn('Initial camera listing warning:', e);
+    }
+
     const select = document.getElementById('select-camera-device');
-    select.innerHTML = videoInputDevices.map((device, idx) => 
-      `<option value="${device.deviceId}">${device.label || `Camera ${idx + 1}`}</option>`
-    ).join('');
+    if (videoInputDevices.length > 0 && select) {
+      select.innerHTML = videoInputDevices.map((device, idx) => 
+        `<option value="${device.deviceId}">${device.label || `Camera ${idx + 1}`}</option>`
+      ).join('');
+    }
 
-    const selectedDeviceId = videoInputDevices.length > 0 ? videoInputDevices[0].deviceId : undefined;
+    let selectedDeviceId = deviceIdToUse || (select ? select.value : null);
+
+    if (!deviceIdToUse && videoInputDevices.length > 0) {
+      // Find back/rear camera device automatically
+      const backCamera = videoInputDevices.find(device => {
+        const label = (device.label || '').toLowerCase();
+        return label.includes('back') || label.includes('rear') || label.includes('environment') || label.includes('facing back') || label.includes('main') || label.includes('0, facing back');
+      });
+
+      if (backCamera) {
+        selectedDeviceId = backCamera.deviceId;
+      } else if (videoInputDevices.length > 1) {
+        // Mobile back camera is usually the last camera device
+        selectedDeviceId = videoInputDevices[videoInputDevices.length - 1].deviceId;
+      } else {
+        selectedDeviceId = videoInputDevices[0].deviceId;
+      }
+    }
+
+    if (selectedDeviceId && select) {
+      select.value = selectedDeviceId;
+    }
 
     let lastScanTime = 0;
     let lastScanCode = '';
 
-    codeReader.decodeFromVideoDevice(selectedDeviceId, 'camera-video', (result, err) => {
+    const handleCameraResult = (result, err) => {
       if (result) {
         const code = result.getText();
         const now = Date.now();
 
-        // Debounce continuous camera scanning (500ms debounce window)
         if (code !== lastScanCode || (now - lastScanTime) > 800) {
           lastScanCode = code;
           lastScanTime = now;
+
+          // Immediately STOP camera & close camera overlay modal
+          stopCameraScanner();
+          const modalCam = document.getElementById('modal-camera-scanner');
+          if (modalCam) modalCam.classList.add('hidden');
+
+          // Process scanned code & open item verification popup modal
           handleBarcodeScan(code);
         }
       }
-    });
+    };
+
+    if (selectedDeviceId) {
+      codeReader.decodeFromVideoDevice(selectedDeviceId, 'camera-video', handleCameraResult);
+    } else {
+      // Fallback decode from constraints with environment facing mode (back camera)
+      codeReader.decodeFromConstraints({ video: { facingMode: { ideal: "environment" } } }, 'camera-video', handleCameraResult);
+    }
 
     state.isScanningCamera = true;
 
+    // Update dropdown labels after stream initializes (if labels were blank before permission)
+    setTimeout(async () => {
+      try {
+        const updatedDevices = await codeReader.listVideoInputDevices();
+        if (updatedDevices.length > 0 && select) {
+          const currentVal = select.value;
+          select.innerHTML = updatedDevices.map((device, idx) => 
+            `<option value="${device.deviceId}">${device.label || `Camera ${idx + 1}`}</option>`
+          ).join('');
+          if (currentVal && Array.from(select.options).some(opt => opt.value === currentVal)) {
+            select.value = currentVal;
+          }
+        }
+      } catch (e) {
+        console.warn('Camera label refresh warning:', e);
+      }
+    }, 800);
+
   } catch (err) {
     console.error('Camera scanner error:', err);
-    showToast('Could not access camera scanner', 'error');
+    showToast('Could not access back camera scanner', 'error');
   }
 }
 
 function stopCameraScanner() {
   if (state.zxingReader) {
     state.zxingReader.reset();
-    state.zxingReader = null;
   }
   state.isScanningCamera = false;
 }
+
+// ------------------------------------------
+// ITEM VERIFICATION POPUP MODAL ENGINE
+// ------------------------------------------
+function displayItemVerificationPopup(item, isExtra = false) {
+  state.activeScanItem = item;
+  const modal = document.getElementById('modal-item-verification');
+  if (!modal) return;
+
+  // Header & Title
+  const badge = document.getElementById('popup-product-status-badge');
+  badge.className = `badge ${isExtra ? 'badge-danger' : 'badge-success'}`;
+  badge.textContent = isExtra ? 'UNLISTED EXTRA PRODUCT' : 'LISTED EXCEL ITEM';
+
+  document.getElementById('popup-product-title').textContent = `${item.brand || 'Item'} - ${item.nature || 'Garment'} (${item.design || 'Style N/A'})`;
+  document.getElementById('popup-product-ean').textContent = item.ean;
+  document.getElementById('popup-product-row-num').textContent = isExtra ? 'N/A' : `#${item.rowIndex}`;
+
+  // Product Specs
+  document.getElementById('popup-val-brand').textContent = item.brand || '-';
+  document.getElementById('popup-val-nature').textContent = item.nature || '-';
+  document.getElementById('popup-val-design').textContent = item.design || '-';
+  document.getElementById('popup-val-pattern').textContent = item.pattern || '-';
+  document.getElementById('popup-val-section').textContent = item.section || '-';
+  document.getElementById('popup-val-rate').textContent = item.rate ? `₹${item.rate.toFixed(2)}` : '-';
+
+  // Quantity Verification
+  renderPopupQty(item);
+
+  // MRP Verification Box
+  const boxMrp = document.getElementById('popup-box-mrp-verify');
+  const fieldsConfig = state.currentSession?.verificationFields || {};
+  if (fieldsConfig.mrp !== false) {
+    boxMrp.classList.remove('hidden');
+    document.getElementById('popup-mrp-expected-val').textContent = `₹${(item.expectedMrp || 0).toFixed(2)}`;
+    renderPopupMrpVerifyButtons(item);
+  } else {
+    boxMrp.classList.add('hidden');
+  }
+
+  // Size Verification Box
+  const boxSize = document.getElementById('popup-box-size-verify');
+  if (fieldsConfig.size !== false) {
+    boxSize.classList.remove('hidden');
+    document.getElementById('popup-size-expected-val').textContent = item.expectedSize || 'Unspecified';
+    renderPopupSizeVerifyButtons(item);
+  } else {
+    boxSize.classList.add('hidden');
+  }
+
+  // Remarks
+  const remarksInput = document.getElementById('popup-input-item-remarks');
+  remarksInput.value = item.remarks || '';
+  remarksInput.onchange = () => {
+    item.remarks = remarksInput.value;
+    displayProductCard(item, isExtra);
+    DB.saveSession(state.currentSession);
+  };
+
+  // Show Modal
+  modal.classList.remove('hidden');
+}
+
+function renderPopupQty(item) {
+  const remaining = Math.max(0, item.expectedQty - item.scannedQty);
+  const excess = Math.max(0, item.actualPhysicalQty - item.expectedQty);
+
+  document.getElementById('popup-qty-expected').textContent = item.expectedQty || 0;
+  document.getElementById('popup-qty-scanned').textContent = item.scannedQty;
+  document.getElementById('popup-qty-remaining').textContent = remaining;
+  document.getElementById('popup-qty-excess').textContent = excess;
+  document.getElementById('popup-input-physical-qty').value = item.actualPhysicalQty;
+
+  const qtyStatusBadge = document.getElementById('popup-qty-status-badge');
+  const excessBanner = document.getElementById('popup-excess-alert-banner');
+
+  if (item.scannedQty > item.expectedQty) {
+    qtyStatusBadge.className = 'qty-status-badge badge badge-danger';
+    qtyStatusBadge.textContent = 'EXCESS STOCK';
+    excessBanner.classList.remove('hidden');
+  } else if (item.scannedQty === item.expectedQty) {
+    qtyStatusBadge.className = 'qty-status-badge badge badge-success';
+    qtyStatusBadge.textContent = 'MATCHED';
+    excessBanner.classList.add('hidden');
+  } else {
+    qtyStatusBadge.className = 'qty-status-badge badge badge-warning';
+    qtyStatusBadge.textContent = 'PENDING';
+    excessBanner.classList.add('hidden');
+  }
+}
+
+function renderPopupMrpVerifyButtons(item) {
+  const btnMatch = document.getElementById('popup-btn-mrp-match');
+  const btnDiff = document.getElementById('popup-btn-mrp-diff');
+  const groupDiff = document.getElementById('popup-group-mrp-diff');
+  const inputActualMrp = document.getElementById('popup-input-actual-mrp');
+
+  btnMatch.className = `btn-toggle ${item.mrpStatus === 'Match' ? 'active-match' : ''}`;
+  btnDiff.className = `btn-toggle ${item.mrpStatus === 'Mismatch' ? 'active-diff' : ''}`;
+
+  if (item.mrpStatus === 'Mismatch') {
+    groupDiff.classList.remove('hidden');
+    inputActualMrp.value = item.actualMrp || '';
+  } else {
+    groupDiff.classList.add('hidden');
+  }
+
+  btnMatch.onclick = () => {
+    item.mrpStatus = 'Match';
+    item.actualMrp = item.expectedMrp;
+    renderPopupMrpVerifyButtons(item);
+    displayProductCard(item, !item.rowIndex);
+    updateScanViewSummary();
+    DB.saveSession(state.currentSession);
+  };
+
+  btnDiff.onclick = () => {
+    item.mrpStatus = 'Mismatch';
+    renderPopupMrpVerifyButtons(item);
+    inputActualMrp.focus();
+    displayProductCard(item, !item.rowIndex);
+    updateScanViewSummary();
+    DB.saveSession(state.currentSession);
+  };
+
+  inputActualMrp.onchange = () => {
+    item.actualMrp = parseFloat(inputActualMrp.value) || 0;
+    displayProductCard(item, !item.rowIndex);
+    DB.saveSession(state.currentSession);
+  };
+}
+
+function renderPopupSizeVerifyButtons(item) {
+  const btnMatch = document.getElementById('popup-btn-size-match');
+  const btnDiff = document.getElementById('popup-btn-size-diff');
+  const groupDiff = document.getElementById('popup-group-size-diff');
+  const inputActualSize = document.getElementById('popup-input-actual-size');
+
+  btnMatch.className = `btn-toggle ${item.sizeStatus === 'Match' ? 'active-match' : ''}`;
+  btnDiff.className = `btn-toggle ${item.sizeStatus === 'Mismatch' ? 'active-diff' : ''}`;
+
+  if (item.sizeStatus === 'Mismatch') {
+    groupDiff.classList.remove('hidden');
+    inputActualSize.value = item.actualSize || '';
+  } else {
+    groupDiff.classList.add('hidden');
+  }
+
+  btnMatch.onclick = () => {
+    item.sizeStatus = 'Match';
+    item.actualSize = item.expectedSize;
+    renderPopupSizeVerifyButtons(item);
+    displayProductCard(item, !item.rowIndex);
+    updateScanViewSummary();
+    DB.saveSession(state.currentSession);
+  };
+
+  btnDiff.onclick = () => {
+    item.sizeStatus = 'Mismatch';
+    renderPopupSizeVerifyButtons(item);
+    inputActualSize.focus();
+    displayProductCard(item, !item.rowIndex);
+    updateScanViewSummary();
+    DB.saveSession(state.currentSession);
+  };
+
+  inputActualSize.onchange = () => {
+    item.actualSize = inputActualSize.value.trim();
+    displayProductCard(item, !item.rowIndex);
+    DB.saveSession(state.currentSession);
+  };
+}
+
+// Popup Controls Event Listeners
+document.getElementById('popup-btn-qty-add')?.addEventListener('click', () => {
+  if (state.activeScanItem) {
+    executeScanForItem(state.activeScanItem);
+    renderPopupQty(state.activeScanItem);
+  }
+});
+
+document.getElementById('popup-btn-qty-undo')?.addEventListener('click', () => {
+  if (!state.currentSession || !state.currentSession.scanHistory.length) {
+    showToast('No scan history to undo', 'info');
+    return;
+  }
+  const lastScan = state.currentSession.scanHistory.pop();
+  if (lastScan && lastScan.type === 'excel') {
+    const item = state.currentSession.items.find(i => i.rowIndex === lastScan.rowIndex);
+    if (item && item.scannedQty > 0) {
+      item.scannedQty -= 1;
+      if (item.actualPhysicalQty > item.scannedQty) {
+        item.actualPhysicalQty = item.scannedQty;
+      }
+      displayProductCard(item, false);
+      renderPopupQty(item);
+      updateScanViewSummary();
+      DB.saveSession(state.currentSession);
+      showToast(`Scan undone for EAN ${item.ean}`, 'info');
+    }
+  }
+});
+
+document.getElementById('popup-input-physical-qty')?.addEventListener('change', (e) => {
+  if (state.activeScanItem) {
+    const val = parseInt(e.target.value, 10);
+    if (!isNaN(val) && val >= 0) {
+      state.activeScanItem.actualPhysicalQty = val;
+      displayProductCard(state.activeScanItem, !state.activeScanItem.rowIndex);
+      renderPopupQty(state.activeScanItem);
+      updateScanViewSummary();
+      DB.saveSession(state.currentSession);
+    }
+  }
+});
+
+document.getElementById('btn-close-verification-modal')?.addEventListener('click', () => {
+  document.getElementById('modal-item-verification').classList.add('hidden');
+});
+
+document.getElementById('btn-confirm-close-verification')?.addEventListener('click', () => {
+  if (state.currentSession) {
+    DB.saveSession(state.currentSession);
+  }
+  document.getElementById('modal-item-verification').classList.add('hidden');
+  showToast('Item verification saved', 'success');
+});
+
+document.getElementById('btn-confirm-scan-next-camera')?.addEventListener('click', () => {
+  if (state.currentSession) {
+    DB.saveSession(state.currentSession);
+  }
+  document.getElementById('modal-item-verification').classList.add('hidden');
+
+  // Re-open camera scanner modal and start back camera scanner
+  const modalCam = document.getElementById('modal-camera-scanner');
+  modalCam.classList.remove('hidden');
+  startCameraScanner();
+});
 
 // ==========================================
 // 9. INVENTORY OVERVIEW & EXCEPTION SCREEN
